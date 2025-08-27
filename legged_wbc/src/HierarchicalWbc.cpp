@@ -8,7 +8,7 @@
 
 namespace legged {
 vector_t HierarchicalWbc::update(const vector_t& stateDesired, const vector_t& inputDesired, const vector_t& rbdStateMeasured, size_t mode,
-                                 scalar_t period) {
+                                 scalar_t period, std::string method) {
   WbcBase::update(stateDesired, inputDesired, rbdStateMeasured, mode, period);
 
   Task task0 = formulateFloatingBaseEomTask() + formulateTorqueLimitsTask() + formulateFrictionConeTask() + formulateNoContactMotionTask();

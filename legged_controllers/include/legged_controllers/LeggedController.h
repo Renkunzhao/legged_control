@@ -8,6 +8,9 @@
 #include <hardware_interface/imu_sensor_interface.h>
 #include <legged_common/hardware_interface/ContactSensorInterface.h>
 
+#include <vector>
+#include <memory>
+#include <std_msgs/Bool.h>
 #include <ocs2_centroidal_model/CentroidalModelRbdConversions.h>
 #include <ocs2_core/misc/Benchmark.h>
 #include <ocs2_legged_robot_ros/visualization/LeggedRobotVisualizer.h>
@@ -17,12 +20,22 @@
 #include <legged_interface/LeggedInterface.h>
 #include <legged_wbc/WbcBase.h>
 
+#include "legged_controllers/RobotModel.h"
+#include "legged_controllers/CsvLogger.h"
+
 #include "legged_controllers/SafetyChecker.h"
 #include "legged_controllers/visualization/LeggedSelfCollisionVisualization.h"
 
 namespace legged {
 using namespace ocs2;
 using namespace legged_robot;
+
+struct TrajectoryPoint {
+  double time;
+  double x;
+  double dx;
+  double F;
+};
 
 class LeggedController : public controller_interface::MultiInterfaceController<HybridJointInterface, hardware_interface::ImuSensorInterface,
                                                                                ContactSensorInterface> {
@@ -74,6 +87,25 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   std::atomic_bool controllerRunning_{}, mpcRunning_{};
   benchmark::RepeatedTimer mpcTimer_;
   benchmark::RepeatedTimer wbcTimer_;
+
+  std::unique_ptr<CsvLogger> logger_;
+
+  std::shared_ptr<RobotModel> robotFreeFlyer_, robotComposite_;  // Pinocchio模型
+
+  bool should_jump_ = false;  // 被修改的变量
+  Eigen::VectorXd initial_q_;  // 初始关节位置
+  Eigen::VectorXd initial_com_;  // 初始质心位置
+  std::vector<Eigen::Vector3d> initial_footPositions_;  // 初始足端位置
+  bool staticStance_ = false;  // 是否处于静止状态
+  ros::Time jumpStartTime_;
+  bool jumpStarted_ = false;
+  std::string jumpState_ = "stand"; // jumping, flight, landing
+  ros::Subscriber jump_sub_;
+  void jumpCallback(const std_msgs::Bool::ConstPtr& msg);
+
+  std::vector<TrajectoryPoint> trajectory_;  // 存储轨迹数据
+  bool loadTrajectory(const std::string& filename);  // 加载轨迹文件
+  TrajectoryPoint interpolateTrajectory(double t);
 };
 
 class LeggedCheaterController : public LeggedController {

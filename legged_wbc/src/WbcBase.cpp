@@ -4,6 +4,9 @@
 #include <pinocchio/fwd.hpp>  // forward declarations must be included first.
 
 #include "legged_wbc/WbcBase.h"
+#include "Eigen/src/Core/Matrix.h"
+#include "pinocchio/multibody/joint/joint-free-flyer.hpp"
+#include "pinocchio/spatial/fwd.hpp"
 
 #include <ocs2_centroidal_model/AccessHelperFunctions.h>
 #include <ocs2_centroidal_model/ModelHelperFunctions.h>
@@ -11,6 +14,7 @@
 #include <pinocchio/algorithm/crba.hpp>
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
+#include <pinocchio/math/rpy.hpp>
 #include <utility>
 
 namespace legged {
@@ -27,7 +31,7 @@ WbcBase::WbcBase(const PinocchioInterface& pinocchioInterface, CentroidalModelIn
 }
 
 vector_t WbcBase::update(const vector_t& stateDesired, const vector_t& inputDesired, const vector_t& rbdStateMeasured, size_t mode,
-                         scalar_t /*period*/) {
+                         scalar_t /*period*/ , std::string /*method*/) {
   contactFlag_ = modeNumber2StanceLeg(mode);
   numContacts_ = 0;
   for (bool flag : contactFlag_) {
@@ -158,7 +162,7 @@ Task WbcBase::formulateFrictionConeTask() {
                      0, 1, -frictionCoeff_,
                      0,-1, -frictionCoeff_;  // clang-format on
 
-  matrix_t d(5 * numContacts_ + 3 * (info_.numThreeDofContacts - numContacts_), numDecisionVars_);
+  matrix_t d(5 * numContacts_, numDecisionVars_);
   d.setZero();
   j = 0;
   for (size_t i = 0; i < info_.numThreeDofContacts; ++i) {
@@ -196,6 +200,55 @@ Task WbcBase::formulateBaseAccelTask(const vector_t& stateDesired, const vector_
 
   Vector6 b = AbInv * centroidalMomentumRate;
 
+  return {a, b, matrix_t(), vector_t()};
+}
+
+Task WbcBase::formulateBaseAccelTaskPD(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
+  matrix_t a(6, numDecisionVars_);
+  a.setZero();
+  a.block(0, 0, 6, 6) = matrix_t::Identity(6, 6);
+
+  vector_t jointAccel = centroidal_model::getJointVelocities(inputDesired - inputLast_, info_) / period;
+  inputLast_ = inputDesired;
+  mapping_.setPinocchioInterface(pinocchioInterfaceDesired_);
+
+  const auto& model = pinocchioInterfaceDesired_.getModel();
+  auto& data = pinocchioInterfaceDesired_.getData();
+  const auto qDesired = mapping_.getPinocchioJointPosition(stateDesired);
+  const vector_t vDesired = mapping_.getPinocchioJointVelocity(stateDesired, inputDesired);
+
+  Vector6 pos_error, vel_error, accel, b; 
+
+  Eigen::Vector3d eulerZYX_des = qDesired.segment<3>(3);
+  Eigen::Vector3d eulerZYX = qMeasured_.segment<3>(3);
+
+  Eigen::Matrix3d R_des = pinocchio::rpy::rpyToMatrix(eulerZYX_des.reverse());
+  Eigen::Matrix3d R = pinocchio::rpy::rpyToMatrix(eulerZYX.reverse());
+
+  pinocchio::SE3 T_des(R_des, qDesired.head<3>());
+  pinocchio::SE3 T(R, qMeasured_.head<3>());
+
+  pos_error = pinocchio::log6(T_des * T.inverse()).toVector();
+
+  Eigen::Vector3d eulerZYX_dot_des = vDesired.segment<3>(3);
+  Eigen::Vector3d eulerZYX_dot = vMeasured_.segment<3>(3);
+  
+  Eigen::Vector3d angularVel_des = getGlobalAngularVelocityFromEulerAnglesZyxDerivatives(eulerZYX_des, eulerZYX_dot_des);
+  Eigen::Vector3d angularVel = getGlobalAngularVelocityFromEulerAnglesZyxDerivatives(eulerZYX, eulerZYX_dot);
+
+  vel_error << vDesired.head<3>() - vMeasured_.head<3>(), 
+               angularVel_des - angularVel;
+  
+  accel = baseAccelKp_.asDiagonal() * pos_error + baseAccelKd_.asDiagonal() * vel_error;
+
+  b << accel.head<3>(), 
+      getEulerAnglesZyxDerivativesFromGlobalAngularAcceleration(eulerZYX, eulerZYX_dot, accel.segment<3>(3).eval());
+
+  // ROS_INFO_STREAM("[WBC]:\n"
+  //                 << "Position Error: " << pos_error.transpose() << "\n"
+  //                 << "Velocity Error: " << vel_error.transpose() << "\n"
+  //                 << "Desired Acceleration: " << accel.transpose() << "\n"
+  //                 << "Computed Base Acceleration: " << b.transpose());
   return {a, b, matrix_t(), vector_t()};
 }
 
@@ -240,7 +293,12 @@ Task WbcBase::formulateContactForceTask(const vector_t& inputDesired) const {
 void WbcBase::loadTasksSetting(const std::string& taskFile, bool verbose) {
   // Load task file
   torqueLimits_ = vector_t(info_.actuatedDofNum / 4);
+  baseAccelKp_ = vector_t::Zero(6);
+  baseAccelKd_ = vector_t::Zero(6);
   loadData::loadEigenMatrix(taskFile, "torqueLimitsTask", torqueLimits_);
+  loadData::loadEigenMatrix(taskFile, "baseAcc_kp", baseAccelKp_);
+  loadData::loadEigenMatrix(taskFile, "baseAcc_kd", baseAccelKd_);
+
   if (verbose) {
     std::cerr << "\n #### Torque Limits Task:";
     std::cerr << "\n #### =============================================================================\n";

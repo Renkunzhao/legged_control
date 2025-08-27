@@ -154,7 +154,7 @@ initialState
    ;; Base Pose: [position, orientation] ;;
    (6,0)  0.0     ; p_base_x
    (7,0)  0.0     ; p_base_y
-   (8,0)  0.3     ; p_base_z
+   (8,0)  0.15     ; p_base_z
    (9,0)  0.0     ; theta_base_z
    (10,0) 0.0     ; theta_base_y
    (11,0) 0.0     ; theta_base_x
@@ -299,11 +299,32 @@ swingLegTask
     kd                   37
 }
 
+baseAccelTask
+baseAcc_kp
+{
+   (0,0)  1000.0     ; p_base_x
+   (1,0)  1000.0     ; p_base_y
+   (2,0)  1200.0     ; p_base_z
+   (3,0)  200.0     ; 
+   (4,0)  200.0     ; 
+   (5,0)  200.0     ; 
+}
+
+baseAcc_kd
+{
+   (0,0)  15.0     ; vx
+   (1,0)  15.0     ; vy
+   (2,0)  30.0     ; vz
+   (3,0)  20.0     ; wx
+   (4,0)  20.0     ; wy
+   (5,0)  20.0     ; wz
+}
+
 weight
 {
     swingLeg        100
-    baseAccel       1
-    contactForce    0.01
+    baseAccel       10
+    contactForce    10
 }
 
 ; State Estimation

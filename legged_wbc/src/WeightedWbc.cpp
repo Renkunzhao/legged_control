@@ -9,7 +9,7 @@
 namespace legged {
 
 vector_t WeightedWbc::update(const vector_t& stateDesired, const vector_t& inputDesired, const vector_t& rbdStateMeasured, size_t mode,
-                             scalar_t period) {
+                             scalar_t period, std::string method) {
   WbcBase::update(stateDesired, inputDesired, rbdStateMeasured, mode, period);
 
   // Constraints
@@ -26,8 +26,18 @@ vector_t WeightedWbc::update(const vector_t& stateDesired, const vector_t& input
   ubA << constraints.b_,
          constraints.f_;  // clang-format on
 
+  Task weighedTask;
   // Cost
-  Task weighedTask = formulateWeightedTasks(stateDesired, inputDesired, period);
+  if (method == "centroidal") {
+    // Centroidal method
+    weighedTask = formulateWeightedTasks(stateDesired, inputDesired, period, "centroidal");
+  } else if (method == "pd") {
+    // PD method
+    weighedTask = formulateWeightedTasks(stateDesired, inputDesired, period, "pd");
+  } else {
+    return vector_t::Zero(getNumDecisionVars());
+  }
+
   Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor> H = weighedTask.a_.transpose() * weighedTask.a_;
   vector_t g = -weighedTask.a_.transpose() * weighedTask.b_;
 
@@ -51,9 +61,14 @@ Task WeightedWbc::formulateConstraints() {
   return formulateFloatingBaseEomTask() + formulateTorqueLimitsTask() + formulateFrictionConeTask() + formulateNoContactMotionTask();
 }
 
-Task WeightedWbc::formulateWeightedTasks(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period) {
-  return formulateSwingLegTask() * weightSwingLeg_ + formulateBaseAccelTask(stateDesired, inputDesired, period) * weightBaseAccel_ +
-         formulateContactForceTask(inputDesired) * weightContactForce_;
+Task WeightedWbc::formulateWeightedTasks(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period, std::string method) {
+  if (method == "centroidal") {
+    return formulateSwingLegTask() * weightSwingLeg_ + formulateBaseAccelTask(stateDesired, inputDesired, period) * weightBaseAccel_ +
+          formulateContactForceTask(inputDesired) * weightContactForce_;
+  } else if (method == "pd") {
+    return formulateSwingLegTask() * weightSwingLeg_ + formulateBaseAccelTaskPD(stateDesired, inputDesired, period) * weightBaseAccel_ +
+      formulateContactForceTask(inputDesired) * weightContactForce_;
+  }
 }
 
 void WeightedWbc::loadTasksSetting(const std::string& taskFile, bool verbose) {

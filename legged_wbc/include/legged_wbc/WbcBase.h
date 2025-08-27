@@ -25,7 +25,7 @@ class WbcBase {
   virtual void loadTasksSetting(const std::string& taskFile, bool verbose);
 
   virtual vector_t update(const vector_t& stateDesired, const vector_t& inputDesired, const vector_t& rbdStateMeasured, size_t mode,
-                          scalar_t period);
+                          scalar_t period, std::string method = "centroidal");
 
  protected:
   void updateMeasured(const vector_t& rbdStateMeasured);
@@ -38,6 +38,7 @@ class WbcBase {
   Task formulateNoContactMotionTask();
   Task formulateFrictionConeTask();
   Task formulateBaseAccelTask(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period);
+  Task formulateBaseAccelTaskPD(const vector_t& stateDesired, const vector_t& inputDesired, scalar_t period);
   Task formulateSwingLegTask();
   Task formulateContactForceTask(const vector_t& inputDesired) const;
 
@@ -54,7 +55,7 @@ class WbcBase {
   size_t numContacts_{};
 
   // Task Parameters:
-  vector_t torqueLimits_;
+  vector_t torqueLimits_, baseAccelKp_{}, baseAccelKd_{};
   scalar_t frictionCoeff_{}, swingKp_{}, swingKd_{};
 };
 

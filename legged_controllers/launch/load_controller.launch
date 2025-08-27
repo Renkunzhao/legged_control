@@ -10,6 +10,7 @@
     <param name="taskFile" value="$(find legged_controllers)/config/$(arg robot_type)/task.info"/>
     <param name="referenceFile" value="$(find legged_controllers)/config/$(arg robot_type)/reference.info"/>
     <param name="gaitCommandFile" value="$(find legged_controllers)/config/$(arg robot_type)/gait.info"/>
+    <param name="trajectory_path" value="$(find legged_controllers)/data/jump_trajectory_N1_50_dt1_0.0070_N2_28_dt2_0.0177_N3_50_dt3_0.0070.csv" />
 
     <rosparam file="$(find legged_controllers)/config/controllers.yaml" command="load"/>
 

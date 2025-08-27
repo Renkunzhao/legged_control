@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.10)
 project(legged_controllers)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 ## Find catkin macros and libraries
@@ -54,6 +56,7 @@ link_directories(
 ## Declare a cpp library
 add_library(${PROJECT_NAME}
         src/LeggedController.cpp
+        src/RobotKinematics.cpp
         )
 
 target_link_libraries(${PROJECT_NAME}
@@ -61,7 +64,9 @@ target_link_libraries(${PROJECT_NAME}
         ${pinocchio_LIBRARIES}
         )
 
-target_compile_options(${PROJECT_NAME} PUBLIC ${OCS2_CXX_FLAGS})
+# target_compile_options(${PROJECT_NAME} PUBLIC ${OCS2_CXX_FLAGS})
+# 确保为该库启用 C++17
+target_compile_features(${PROJECT_NAME} PUBLIC cxx_std_17)
 
 
 # Target trajectories publish node

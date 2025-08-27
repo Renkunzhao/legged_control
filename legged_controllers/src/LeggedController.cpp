@@ -2,9 +2,16 @@
 // Created by qiayuan on 2022/6/24.
 //
 
+#include <string>
+#include <vector>
+#include <memory>
 #include <pinocchio/fwd.hpp>  // forward declarations must be included first.
 
+#include <fstream>
+#include <sstream>
+
 #include "legged_controllers/LeggedController.h"
+#include "legged_controllers/RobotModel.h"
 
 #include <ocs2_centroidal_model/AccessHelperFunctions.h>
 #include <ocs2_centroidal_model/CentroidalModelPinocchioMapping.h>
@@ -25,6 +32,67 @@
 #include <pluginlib/class_list_macros.hpp>
 
 namespace legged {
+
+// 回调函数
+void LeggedController::jumpCallback(const std_msgs::Bool::ConstPtr& msg)
+{
+    should_jump_ = msg->data;
+    ROS_INFO("Received jump: %s", should_jump_ ? "true" : "false");
+}
+
+bool legged::LeggedController::loadTrajectory(const std::string& filename) {
+  trajectory_.clear();
+  std::ifstream file(filename);
+  if (!file.is_open()) {
+    ROS_ERROR_STREAM("Failed to open trajectory file: " << filename);
+    return false;
+  }
+
+  std::string line;
+  while (std::getline(file, line)) {
+    std::stringstream ss(line);
+    TrajectoryPoint point;
+    std::string value;
+
+    std::getline(ss, value, ',');
+    point.time = std::stod(value);
+
+    std::getline(ss, value, ',');
+    point.x = std::stod(value);
+
+    std::getline(ss, value, ',');
+    point.dx = std::stod(value);
+
+    std::getline(ss, value, ',');
+    point.F = std::stod(value);
+
+    trajectory_.emplace_back(point);
+  }
+
+  file.close();
+  ROS_INFO_STREAM("Loaded trajectory with " << trajectory_.size() << " points from: " << filename);
+  return true;
+}
+
+TrajectoryPoint LeggedController::interpolateTrajectory(double t) {
+  const double dt = 0.001;  // 1kHz
+  size_t index = static_cast<size_t>(t / dt);
+
+  if (index >= trajectory_.size()) {
+    index = trajectory_.size() - 1;  // 保持最后一个点
+    should_jump_ = false;  // 如果超出范围，停止跳跃
+    jumpStarted_ = false;
+    ROS_WARN("Index out of bounds, using last trajectory point.");
+  }
+
+  // 跳跃状态机
+  if(jumpState_ == "jumping" && trajectory_[index].F == 0){
+    jumpState_ = "flight";
+  }
+
+  return trajectory_[index];
+}
+
 bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& controller_nh) {
   // Initialize OCS2
   std::string urdfFile;
@@ -73,6 +141,30 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
   // Safety Checker
   safetyChecker_ = std::make_shared<SafetyChecker>(leggedInterface_->getCentroidalModelInfo());
 
+  logger_ = std::make_unique<CsvLogger>("/tmp/legged_control_log");
+
+
+  robotFreeFlyer_ = std::make_shared<RobotModel>(urdfFile, "quaternion");
+  robotComposite_ = std::make_shared<RobotModel>(urdfFile, "eulerZYX");
+
+  robotFreeFlyer_->test();
+  robotComposite_->test();
+
+  // 订阅 /jump 话题
+  jump_sub_ = nh.subscribe<std_msgs::Bool>("/jump", 10, boost::bind(&LeggedController::jumpCallback, this, _1));
+
+  std::string traj_path;
+  if (!controller_nh.getParam("/trajectory_path", traj_path)) {
+    ROS_ERROR("trajectory_path not found in param server!");
+    return false;
+  }
+
+  ROS_INFO_STREAM("Trajectory path received: " << traj_path);
+  if (!loadTrajectory(traj_path)) {
+    ROS_ERROR("Failed to load trajectory file.");
+    return false;
+  }
+
   return true;
 }
 
@@ -111,6 +203,170 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   // Evaluate the current policy
   vector_t optimizedState, optimizedInput;
   size_t plannedMode = 0;  // The mode that is active at the time the policy is evaluated at.
+
+  vector_t torque(12), posDes(12), velDes(12);
+
+  // 跳跃控制开始判断
+  if (should_jump_) {
+    if (!jumpStarted_) {
+      jumpStartTime_ = time;  // 记录跳跃起始时间
+      jumpStarted_ = true;
+      jumpState_ = "jumping";  // 设置跳跃状态
+      initial_com_ = measuredRbdState_.head(6);  // 记录初始质心位置
+      initial_q_ = measuredRbdState_.segment(6, 12);
+      initial_footPositions_.clear();
+      initial_footPositions_ = robotFreeFlyer_->computeFootPositionsRbd(measuredRbdState_);
+      ROS_INFO_STREAM("[LeggedController] Jump started at: " << jumpStartTime_);
+      ROS_INFO_STREAM("initial_q_: " << initial_q_.transpose());
+      robotFreeFlyer_->printFootPositions(initial_footPositions_);
+    }
+
+    if (jumpState_ == "jumping") {
+      std::string method = "WBC"; // 控制方法
+      if (method == "PD"){ // pd + feedforward 
+        // 计算轨迹时间（单位秒）
+        double trajTime = (time - jumpStartTime_).toSec();
+        // 插值轨迹控制：该函数负责根据轨迹插值得到优化状态和输入
+        const auto& point =  interpolateTrajectory(trajTime);
+        // 根据z=point.x计算关节位置
+        Eigen::VectorXd q(robotFreeFlyer_->nq());
+        q.head<3>() << 0, 0, point.x; // 设置基座位置
+        robotFreeFlyer_->setBaseOrientationZero(q); // 设置基座方向为零
+        auto footPositions = robotFreeFlyer_->getInitfeetPositions();
+        q = robotFreeFlyer_->inverseKinematicsAllFeet(footPositions, q.head(robotFreeFlyer_->nqBase()), "DLS"); // 逆运动学求解
+        posDes = q.tail(12);
+
+        torque.setZero(12); // 设置力矩为零
+        velDes.setZero(12); // 设置速度为零
+        auto jacobians = robotFreeFlyer_->computeFootJacobians(q); // 计算脚端雅可比矩阵
+        for (size_t i = 0; i < jacobians.size(); ++i) {
+          Eigen::Vector3d force;
+          force << 0, 0, point.F / 4.0; // 每个脚端施加的力
+          torque.segment(3 * i, 3) = - jacobians[i].transpose() * force; // PD控制
+
+          Eigen::Vector3d footVel;
+          footVel << 0, 0, -point.dx; // 脚端速度
+          velDes.segment(3 * i, 3) = jacobians[i].ldlt().solve(footVel); // 设置脚端速度
+        }
+
+        for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
+          hybridJointHandles_[j].setCommand(posDes(j), velDes(j), 0, 3, torque(j));
+        }
+      } else if (method == "WBC") { // WBC 跳跃
+        { // 静止站立测试
+          // optimizedState = Eigen::VectorXd::Zero(24);
+          // optimizedInput = Eigen::VectorXd::Zero(24);
+
+          // // 设置 z, vz
+          // optimizedState(8) = 0.15;
+          // optimizedState.tail(12) = initial_q_; // 使用初始关节位置
+          // // optimizedState.tail(12) << -0.5621, 1.3056, -2.5357,
+          // //                              -0.5621, 1.3056, -2.5357,
+          // //                                0.5621,  1.3056, -2.5357,
+          // //                                0.5621,  1.3056, -2.5357;
+
+          // double force_per_leg = pinocchio::computeTotalMass(robotFreeFlyer_->getModel()) * 9.81 / 4.0;
+          // optimizedInput(2) = force_per_leg;
+          // optimizedInput(5) = force_per_leg;
+          // optimizedInput(8) = force_per_leg;
+          // optimizedInput(11) = force_per_leg;
+        }
+
+        { // sin wave
+          // optimizedState = Eigen::VectorXd::Zero(24);
+          // optimizedInput = Eigen::VectorXd::Zero(24);
+
+          // // 设置 z, vz
+          // optimizedState(8) = 0.3 - 0.1 * std::cos( M_PI * (time - jumpStartTime_).toSec());
+          // optimizedState(2) = - 0.2 * std::sin(M_PI * (time - jumpStartTime_).toSec());
+
+          // Eigen::VectorXd q_base(robotFreeFlyer_->nqBase());
+          // q_base.head<3>() = optimizedState.segment(6, 3); // 设置基座位置
+          // robotFreeFlyer_->setBaseOrientationZero(q_base); // 设置基座方向为零
+          // optimizedState.tail(12) = robotFreeFlyer_->inverseKinematicsAllFeet(initial_footPositions_, q_base, "DLS").tail(12); // 逆运动学求解
+
+          // double force_per_leg = pinocchio::computeTotalMass(robotFreeFlyer_->getModel()) * 9.81 / 4.0;
+          // optimizedInput(2) = force_per_leg;
+          // optimizedInput(5) = force_per_leg;
+          // optimizedInput(8) = force_per_leg;
+          // optimizedInput(11) = force_per_leg;
+        }
+
+        { // jump
+          // 计算轨迹时间（单位秒）
+          double trajTime = (time - jumpStartTime_).toSec();
+          // 插值轨迹控制：该函数负责根据轨迹插值得到优化状态和输入
+          const auto& point =  interpolateTrajectory(trajTime);
+
+          optimizedState = Eigen::VectorXd::Zero(24);
+          optimizedInput = Eigen::VectorXd::Zero(24);
+
+          // 设置 z, vz
+          optimizedState(8) = point.x;
+          optimizedState(2) = point.dx;
+
+          Eigen::VectorXd q_base(robotFreeFlyer_->nqBase());
+          q_base.head<3>() = optimizedState.segment(6, 3); // 设置基座位置
+          robotFreeFlyer_->setBaseOrientationZero(q_base); // 设置基座方向为零
+          optimizedState.tail(12) = robotFreeFlyer_->inverseKinematicsAllFeet(robotFreeFlyer_->getInitfeetPositions(), q_base, "DLS").tail(12); // 逆运动学求解
+
+          // 设置 接触力
+          double force_per_leg = point.F / 4.0;
+          optimizedInput(2) = force_per_leg;
+          optimizedInput(5) = force_per_leg;
+          optimizedInput(8) = force_per_leg;
+          optimizedInput(11) = force_per_leg;
+        }
+
+        currentObservation_.input = optimizedInput;
+
+        plannedMode = 15; // STANCE
+
+        auto rbdState = measuredRbdState_;
+        rbdState[0] -= initial_com_[0]; // 调整质心位置
+        rbdState.segment(3, 2) -= initial_com_.segment(3, 2); // 调整质心位置
+
+        wbcTimer_.startTimer();
+        vector_t x = wbc_->update(optimizedState, optimizedInput, rbdState, plannedMode, period.toSec(), "pd");
+        wbcTimer_.endTimer();
+
+        torque = x.tail(12);
+
+        posDes = centroidal_model::getJointAngles(optimizedState, leggedInterface_->getCentroidalModelInfo());
+        velDes = centroidal_model::getJointVelocities(optimizedInput, leggedInterface_->getCentroidalModelInfo());
+
+        for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
+          hybridJointHandles_[j].setCommand(posDes(j), velDes(j), 50, 3, torque(j));
+        }
+
+        // logger_->log("dotu", x.head(18));
+        // logger_->log("F", x.segment(18, 12));
+        // logger_->log("tail", x.tail( 12));
+        // logger_->log("F_des", optimizedInput.head(12));
+      }
+    } else if (jumpState_ == "flight") {
+      Eigen::VectorXd q(robotFreeFlyer_->nq());
+      q.head<3>() << 0, 0, 0.15; // 设置基座位置
+      robotFreeFlyer_->setBaseOrientationZero(q); // 设置基座方向为零
+      auto footPositions = robotFreeFlyer_->getInitfeetPositions();
+      q = robotFreeFlyer_->inverseKinematicsAllFeet(footPositions, q.head(robotFreeFlyer_->nqBase()), "DLS"); // 逆运动学求解
+      posDes = q.tail(12);
+      velDes.setZero(12);
+      torque.setZero(12);
+      for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
+        hybridJointHandles_[j].setCommand(posDes(j), velDes(j), 50, 3, torque(j));
+      }
+
+      if ((time - jumpStartTime_).toSec() > 2) { // 假设飞行时间为0.5秒
+        jumpState_ = "stand"; // 跳跃结束，进入站立状态
+        jumpStarted_ = false;
+        should_jump_ = false;
+        ROS_INFO_STREAM("[LeggedController] Jump ended at: " << time);
+      }
+    }
+
+  } else {
+    // 默认的基于 MPC 的控制逻辑
   mpcMrtInterface_->evaluatePolicy(currentObservation_.time, currentObservation_.state, optimizedState, optimizedInput, plannedMode);
 
   // Whole body control
@@ -120,10 +376,10 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   vector_t x = wbc_->update(optimizedState, optimizedInput, measuredRbdState_, plannedMode, period.toSec());
   wbcTimer_.endTimer();
 
-  vector_t torque = x.tail(12);
+  torque = x.tail(12);
 
-  vector_t posDes = centroidal_model::getJointAngles(optimizedState, leggedInterface_->getCentroidalModelInfo());
-  vector_t velDes = centroidal_model::getJointVelocities(optimizedInput, leggedInterface_->getCentroidalModelInfo());
+  posDes = centroidal_model::getJointAngles(optimizedState, leggedInterface_->getCentroidalModelInfo());
+  velDes = centroidal_model::getJointVelocities(optimizedInput, leggedInterface_->getCentroidalModelInfo());
 
   // Safety check, if failed, stop the controller
   if (!safetyChecker_->check(currentObservation_, optimizedState, optimizedInput)) {
@@ -134,6 +390,33 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   for (size_t j = 0; j < leggedInterface_->getCentroidalModelInfo().actuatedDofNum; ++j) {
     hybridJointHandles_[j].setCommand(posDes(j), velDes(j), 0, 3, torque(j));
   }
+  }
+
+  Eigen::VectorXd q_pinocchio, v_pinocchio;
+  robotFreeFlyer_->convertRbdStateToPinocchio(measuredRbdState_, q_pinocchio, v_pinocchio);
+  pinocchio::centerOfMass(robotFreeFlyer_->getModel(), robotFreeFlyer_->getData(), q_pinocchio, v_pinocchio);
+  auto footPositions = robotFreeFlyer_->computeFootPositions(q_pinocchio);
+
+  vector_t jointEffort(hybridJointHandles_.size());
+  for (size_t i = 0; i < hybridJointHandles_.size(); ++i) {
+    jointEffort(i) = hybridJointHandles_[i].getEffort();
+  }
+
+  logger_->log("time", ros::Time::now().toSec());
+  logger_->log("state", optimizedState);
+  logger_->log("input", optimizedInput);
+
+  logger_->log("rbdst_state", measuredRbdState_);
+  logger_->log("torque", jointEffort);
+
+  // logger_->log("z", point.x);
+  // logger_->log("dz", point.dx);
+  logger_->log("CoM", robotFreeFlyer_->getData().com[0]);
+  logger_->log("CoM_vel", robotFreeFlyer_->getData().vcom[0]);
+  logger_->log("foot_positions(LF)", footPositions[0]);
+  logger_->log("foot_positions(LH)", footPositions[1]);
+  logger_->log("foot_positions(RF)", footPositions[2]);
+  logger_->log("foot_positions(RH)", footPositions[3]);
 
   // Visualization
   robotVisualizer_->update(currentObservation_, mpcMrtInterface_->getPolicy(), mpcMrtInterface_->getCommand());
@@ -141,6 +424,8 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
 
   // Publish the observation. Only needed for the command interface
   observationPublisher_.publish(ros_msg_conversions::createObservationMsg(currentObservation_));
+
+  logger_->flush();
 }
 
 void LeggedController::updateStateEstimation(const ros::Time& time, const ros::Duration& period) {
