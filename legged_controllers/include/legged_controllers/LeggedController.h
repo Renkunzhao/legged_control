@@ -18,6 +18,7 @@
 
 #include <legged_estimation/StateEstimateBase.h>
 #include <legged_interface/LeggedInterface.h>
+#include <legged_wbc/LeggedState.h>
 #include <legged_wbc/WbcBase.h>
 
 #include "legged_controllers/RobotModel.h"
@@ -57,6 +58,7 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   virtual void setupStateEstimate(const std::string& taskFile, bool verbose);
 
   // Interface
+  std::shared_ptr<CentroidalModelPinocchioMapping> mappingPtr_;
   std::shared_ptr<LeggedInterface> leggedInterface_;
   std::shared_ptr<PinocchioEndEffectorKinematics> eeKinematicsPtr_;
   std::vector<HybridJointHandle> hybridJointHandles_;
@@ -66,6 +68,7 @@ class LeggedController : public controller_interface::MultiInterfaceController<H
   // State Estimation
   SystemObservation currentObservation_;
   vector_t measuredRbdState_;
+  LeggedState leggedState_;
   std::shared_ptr<StateEstimateBase> stateEstimate_;
   std::shared_ptr<CentroidalModelRbdConversions> rbdConversions_;
 

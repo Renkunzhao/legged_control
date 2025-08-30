@@ -12,6 +12,10 @@
 
 #include "legged_controllers/LeggedController.h"
 #include "legged_controllers/RobotModel.h"
+#include "legged_interface/LeggedInterface.h"
+#include "ocs2_pinocchio_interface/PinocchioInterface.h"
+
+#include <pinocchio/algorithm/centroidal.hpp>
 
 #include <ocs2_centroidal_model/AccessHelperFunctions.h>
 #include <ocs2_centroidal_model/CentroidalModelPinocchioMapping.h>
@@ -94,6 +98,8 @@ TrajectoryPoint LeggedController::interpolateTrajectory(double t) {
 }
 
 bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHandle& controller_nh) {
+  std::cout << "[LeggedController]: Init." << std::endl;
+
   // Initialize OCS2
   std::string urdfFile;
   std::string taskFile;
@@ -109,13 +115,13 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
   setupMrt();
   // Visualization
   ros::NodeHandle nh;
-  CentroidalModelPinocchioMapping pinocchioMapping(leggedInterface_->getCentroidalModelInfo());
-  eeKinematicsPtr_ = std::make_shared<PinocchioEndEffectorKinematics>(leggedInterface_->getPinocchioInterface(), pinocchioMapping,
+  mappingPtr_ = std::make_shared<CentroidalModelPinocchioMapping>(leggedInterface_->getCentroidalModelInfo());
+  eeKinematicsPtr_ = std::make_shared<PinocchioEndEffectorKinematics>(leggedInterface_->getPinocchioInterface(), *mappingPtr_,
                                                                       leggedInterface_->modelSettings().contactNames3DoF);
   robotVisualizer_ = std::make_shared<LeggedRobotVisualizer>(leggedInterface_->getPinocchioInterface(),
                                                              leggedInterface_->getCentroidalModelInfo(), *eeKinematicsPtr_, nh);
   selfCollisionVisualization_.reset(new LeggedSelfCollisionVisualization(leggedInterface_->getPinocchioInterface(),
-                                                                         leggedInterface_->getGeometryInterface(), pinocchioMapping, nh));
+                                                                         leggedInterface_->getGeometryInterface(), *mappingPtr_, nh));
 
   // Hardware interface
   auto* hybridJointInterface = robot_hw->get<HybridJointInterface>();
@@ -133,16 +139,21 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
   // State estimation
   setupStateEstimate(taskFile, verbose);
 
+  leggedState_.init(leggedInterface_->getCentroidalModelInfo().actuatedDofNum);
+  leggedState_.createCustomState("q_pin", {"base_pos", "base_eulerZYX", "joint_pos"});
+  leggedState_.createCustomState("v_pin", {"base_lin_vel_W", "base_eulerZYX_dot", "joint_vel"});
+
   // Whole body control
-  wbc_ = std::make_shared<WeightedWbc>(leggedInterface_->getPinocchioInterface(), leggedInterface_->getCentroidalModelInfo(),
-                                       *eeKinematicsPtr_);
-  wbc_->loadTasksSetting(taskFile, verbose);
+  wbc_ = std::make_shared<WeightedWbc>();
+  std::string wbcConfigFile;
+  controller_nh.getParam("/wbcConfigFile", wbcConfigFile);
+  std::cout << "[LeggedController]: " << wbcConfigFile << std::endl;
+  wbc_->loadTasksSetting(wbcConfigFile, verbose);
 
   // Safety Checker
   safetyChecker_ = std::make_shared<SafetyChecker>(leggedInterface_->getCentroidalModelInfo());
 
   logger_ = std::make_unique<CsvLogger>("/tmp/legged_control_log");
-
 
   robotFreeFlyer_ = std::make_shared<RobotModel>(urdfFile, "quaternion");
   robotComposite_ = std::make_shared<RobotModel>(urdfFile, "eulerZYX");
@@ -327,7 +338,19 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
         rbdState.segment(3, 2) -= initial_com_.segment(3, 2); // 调整质心位置
 
         wbcTimer_.startTimer();
-        vector_t x = wbc_->update(optimizedState, optimizedInput, rbdState, plannedMode, period.toSec(), "pd");
+        mappingPtr_->setPinocchioInterface(leggedInterface_->getPinocchioInterface()); 
+        const auto qDesired = mappingPtr_->getPinocchioJointPosition(optimizedState);
+
+        const auto& model = leggedInterface_->getPinocchioInterface().getModel();
+        auto& data = leggedInterface_->getPinocchioInterface().getData();
+        pinocchio::computeCentroidalMap(model, data, qDesired);
+        const auto vDesired = mappingPtr_->getPinocchioJointVelocity(optimizedState, optimizedInput);
+
+        leggedState_.setFromRbdState(measuredRbdState_);
+        vector_t x = wbc_->update(qDesired, vDesired, optimizedInput.head(12), 
+                                  leggedState_.custom_state("q_pin"),
+                                  leggedState_.custom_state("v_pin"),
+                                 modeNumber2StanceLeg(plannedMode), period.toSec(), "pd");
         wbcTimer_.endTimer();
 
         torque = x.tail(12);
@@ -373,8 +396,19 @@ void LeggedController::update(const ros::Time& time, const ros::Duration& period
   currentObservation_.input = optimizedInput;
 
   wbcTimer_.startTimer();
-  vector_t x = wbc_->update(optimizedState, optimizedInput, measuredRbdState_, plannedMode, period.toSec());
-  wbcTimer_.endTimer();
+  mappingPtr_->setPinocchioInterface(leggedInterface_->getPinocchioInterface()); 
+  const auto qDesired = mappingPtr_->getPinocchioJointPosition(optimizedState);
+
+  const auto& model = leggedInterface_->getPinocchioInterface().getModel();
+  auto& data = leggedInterface_->getPinocchioInterface().getData();
+  pinocchio::computeCentroidalMap(model, data, qDesired);
+  const auto vDesired = mappingPtr_->getPinocchioJointVelocity(optimizedState, optimizedInput);
+
+  leggedState_.setFromRbdState(measuredRbdState_);
+  vector_t x = wbc_->update(qDesired, vDesired, optimizedInput.head(12), 
+                          leggedState_.custom_state("q_pin"),
+                          leggedState_.custom_state("v_pin"),
+                          modeNumber2StanceLeg(plannedMode), period.toSec(), "pd");wbcTimer_.endTimer();
 
   torque = x.tail(12);
 
