@@ -148,7 +148,7 @@ bool LeggedController::init(hardware_interface::RobotHW* robot_hw, ros::NodeHand
   std::string wbcConfigFile;
   controller_nh.getParam("/wbcConfigFile", wbcConfigFile);
   std::cout << "[LeggedController]: " << wbcConfigFile << std::endl;
-  wbc_->loadTasksSetting(wbcConfigFile, verbose);
+  wbc_->loadTasksSetting(wbcConfigFile);
 
   // Safety Checker
   safetyChecker_ = std::make_shared<SafetyChecker>(leggedInterface_->getCentroidalModelInfo());
